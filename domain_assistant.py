@@ -20,10 +20,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import urllib.error
+import urllib.request
+
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
-load_dotenv(Path(__file__).resolve().with_name(".env"))
+load_dotenv(Path(__file__).resolve().with_name(".env"), override=True)
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
@@ -242,6 +245,123 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+class GeminiGenerator:
+    """Generates text via Google Gemini API using OpenAI-compatible client and native REST."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        max_output_tokens: int = 300,
+    ) -> None:
+        key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+        ).strip().strip("'\"")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) is missing from .env")
+        self.api_key = key
+        model_name = (
+            (model or os.getenv("GEMINI_MODEL", "")).strip().strip("'\"")
+            or "gemini-3.5-flash-lite"
+        )
+        self.model = model_name
+        self.max_output_tokens = max_output_tokens
+        self._working_method: str | None = None
+        self._openai_client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+
+    def _call_raw(self, url: str, headers: dict[str, str], body_bytes: bytes) -> tuple[int, str]:
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=45) as response:
+                return 200, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            return exc.code, error_body
+        except urllib.error.URLError as exc:
+            return 0, str(exc)
+
+    def generate(self, prompt: str) -> str:
+        clean_model = (
+            self.model
+            if not self.model.startswith("models/")
+            else self.model[len("models/") :]
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+            "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+        }
+        body_bytes = json.dumps(payload).encode("utf-8")
+
+        endpoints_to_try = [
+            # 1. v1beta query param
+            (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={self.api_key}",
+                {"Content-Type": "application/json"},
+            ),
+            # 2. v1beta header
+            (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent",
+                {"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+            ),
+            # 3. v1 query param
+            (
+                f"https://generativelanguage.googleapis.com/v1/models/{clean_model}:generateContent?key={self.api_key}",
+                {"Content-Type": "application/json"},
+            ),
+            # 4. v1 header
+            (
+                f"https://generativelanguage.googleapis.com/v1/models/{clean_model}:generateContent",
+                {"Content-Type": "application/json", "x-goog-api-key": self.api_key},
+            ),
+        ]
+
+        last_error = ""
+        for url, headers in endpoints_to_try:
+            code, resp_text = self._call_raw(url, headers, body_bytes)
+            if code == 200:
+                self._working_method = "rest"
+                return self._parse_response(resp_text)
+            last_error = resp_text
+
+        raise RuntimeError(
+            f"Google API từ chối API key với model '{self.model}': {last_error}"
+        )
+
+    def _parse_response(self, resp_text: str) -> str:
+        resp_data = json.loads(resp_text)
+        candidates = resp_data.get("candidates", [])
+        if not candidates:
+            prompt_feedback = resp_data.get("promptFeedback", {})
+            block_reason = prompt_feedback.get("blockReason", "CONTENT_FILTER")
+            return f"I cannot answer this request as it is out of scope or restricted ({block_reason})."
+
+        first_candidate = candidates[0]
+        content = first_candidate.get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            finish_reason = first_candidate.get("finishReason", "UNKNOWN")
+            return f"I cannot answer this request ({finish_reason})."
+
+        answer = "".join(part.get("text", "") for part in parts).strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -264,6 +384,27 @@ class OpenAIGenerator:
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
+
+
+def _resolve_default_generator() -> TextGenerator:
+    """Automatically select Gemini or OpenAI based on .env configuration."""
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+    ).strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if gemini_key and not gemini_key.startswith("your_"):
+        return GeminiGenerator()
+    if openai_key and not openai_key.startswith("your_"):
+        return OpenAIGenerator()
+    if gemini_key:
+        return GeminiGenerator()
+    if openai_key:
+        return OpenAIGenerator()
+
+    raise RuntimeError(
+        "No API key configured in .env. Please set GEMINI_API_KEY (or OPENAI_API_KEY)."
+    )
 
 
 @dataclass(frozen=True)
@@ -299,7 +440,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _resolve_default_generator(),
             top_k,
         )
 
@@ -451,6 +592,8 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        if index < total:
+            time.sleep(1.0)
 
     return {
         "schema_version": "1.0",
